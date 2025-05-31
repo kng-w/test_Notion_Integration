@@ -1,0 +1,213 @@
+# .github/workflows/issue-to-notion.yml
+
+# 1行目: ワークフローの名前を定義
+# GitHub ActionsのUIでこの名前が表示される
+name: Sync GitHub Issues to Notion
+
+# 3行目〜6行目: このワークフローが実行されるタイミングを定義
+# 「on:」以下がトリガー条件
+on:
+  issues:
+    # Issue に関するイベントのうち、以下の4つのアクションで実行
+    types: [opened, edited, closed, reopened]
+    # opened: 新しいIssueが作成された時
+    # edited: 既存のIssueが編集された時（タイトル、本文、ラベル変更等）
+    # closed: Issueがクローズされた時
+    # reopened: クローズされたIssueが再オープンされた時
+
+# 8行目〜10行目: 実行するジョブを定義
+# 複数のジョブを定義可能だが、今回は1つのジョブのみ
+jobs:
+  # ジョブ名「sync-to-notion」を定義
+  sync-to-notion:
+    # 11行目: このジョブが実行される仮想マシンのOSを指定
+    # ubuntu-latest = 最新のUbuntu Linux環境
+    # 他に windows-latest, macos-latest も選択可能
+    runs-on: ubuntu-latest
+    
+    # 13行目〜15行目: このジョブ内で実行する個別のステップを定義
+    steps:
+    # 最初のステップ: リポジトリのコードをダウンロード
+    - name: Checkout repository
+      # GitHub公式のアクション「checkout@v4」を使用
+      # リポジトリの内容を仮想マシンにコピーする
+      uses: actions/checkout@v4
+    
+    # 2番目のステップ: Node.js環境をセットアップ
+    - name: Setup Node.js
+      # GitHub公式のNode.js セットアップアクションを使用
+      uses: actions/setup-node@v4
+      # アクションのパラメータを「with:」で指定
+      with:
+        # Node.js のバージョンを18に指定
+        node-version: '18'
+        # npm のキャッシュを有効化（ビルド時間短縮）
+        cache: 'npm'
+    
+    # 3番目のステップ: メインの処理（Notion API呼び出し）
+    - name: Sync Issue to Notion
+      # 26行目〜29行目: このステップで使用する環境変数を定義
+      env:
+        # Notion API トークン（GitHubのSecretsから取得）
+        NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        # 連携先のNotionデータベースID（GitHubのSecretsから取得）
+        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        # GitHub API トークン（GitHub Actionsで自動提供）
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # 30行目以降: 実際に実行するコマンドやスクリプト
+      # 「run: |」は複数行のコマンドを実行することを示す
+      run: |
+        # インラインでJavaScriptファイルを作成
+        # 「cat > ファイル名 << 'EOF'」で複数行テキストをファイルに書き込み
+        cat > sync-script.js << 'EOF'
+        
+        // Notion API のクライアントライブラリをインポート
+        const { Client } = require('@notionhq/client');
+        
+        // 環境変数からNotion APIトークンを取得してクライアント初期化
+        const notion = new Client({ auth: process.env.NOTION_TOKEN });
+        
+        // 環境変数からNotionデータベースIDを取得
+        const databaseId = process.env.NOTION_DATABASE_ID;
+        
+        // GitHub Actionsから提供されるコンテキスト情報を取得
+        // GITHUB_CONTEXTにはIssueの詳細情報が含まれている
+        const context = JSON.parse(process.env.GITHUB_CONTEXT);
+        const issue = context.event.issue;
+        const action = context.event.action;
+        
+        // メイン処理を行う非同期関数
+        async function syncIssueToNotion() {
+          try {
+            // Step 1: 同じIssue番号のレコードがNotionに既に存在するかチェック
+            const existingPages = await notion.databases.query({
+              database_id: databaseId,
+              filter: {
+                property: 'Issue Number',  // Issue Number プロパティで検索
+                number: {
+                  equals: issue.number  // GitHubのIssue番号と一致するものを探す
+                }
+              }
+            });
+            
+            // Step 2: Notionページのプロパティデータを構築
+            const pageData = {
+              // タイトルプロパティ: IssueのタイトルをNotionのタイトルに設定
+              'Title': {
+                title: [
+                  {
+                    text: {
+                      content: issue.title
+                    }
+                  }
+                ]
+              },
+              
+              // 数値プロパティ: GitHubのIssue番号
+              'Issue Number': {
+                number: issue.number
+              },
+              
+              // セレクトプロパティ: IssueのステータスをNotionのステータスに変換
+              'Status': {
+                select: {
+                  name: issue.state === 'open' ? 'Open' : 'Closed'
+                }
+              },
+              
+              // リッチテキストプロパティ: 担当者の情報
+              'Assignee': issue.assignee ? {
+                rich_text: [
+                  {
+                    text: {
+                      content: issue.assignee.login  // GitHubユーザー名
+                    }
+                  }
+                ]
+              } : {
+                rich_text: []  // 担当者がいない場合は空
+              },
+              
+              // マルチセレクトプロパティ: Issueのラベル一覧
+              'Labels': {
+                multi_select: issue.labels.map(label => ({
+                  name: label.name
+                }))
+              },
+              
+              // 日付プロパティ: Issue作成日時
+              'Created At': {
+                date: {
+                  start: issue.created_at
+                }
+              },
+              
+              // 日付プロパティ: Issue更新日時
+              'Updated At': {
+                date: {
+                  start: issue.updated_at
+                }
+              },
+              
+              // URLプロパティ: GitHubのIssueページへのリンク
+              'URL': {
+                url: issue.html_url
+              },
+              
+              // リッチテキストプロパティ: Issueの本文
+              'Body': {
+                rich_text: [
+                  {
+                    text: {
+                      content: issue.body || ''  // 本文がない場合は空文字
+                    }
+                  }
+                ]
+              }
+            };
+            
+            // Step 3: 既存レコードの有無によって処理を分岐
+            if (existingPages.results.length > 0) {
+              // 既存レコードが見つかった場合: 更新処理
+              const pageId = existingPages.results[0].id;
+              await notion.pages.update({
+                page_id: pageId,
+                properties: pageData
+              });
+              console.log(`Updated existing Notion page for issue #${issue.number}`);
+              
+            } else {
+              // 既存レコードが見つからない場合: 新規作成
+              await notion.pages.create({
+                parent: { database_id: databaseId },
+                properties: pageData
+              });
+              console.log(`Created new Notion page for issue #${issue.number}`);
+            }
+            
+          } catch (error) {
+            // エラーが発生した場合のハンドリング
+            console.error('Error syncing to Notion:', error);
+            process.exit(1);  // エラーで終了（ワークフローを失敗状態にする）
+          }
+        }
+        
+        // メイン関数を実行
+        syncIssueToNotion();
+        
+        EOF
+        
+        # GitHubコンテキスト情報を環境変数として設定
+        # GitHub Actionsから提供される情報をJavaScriptで読み込み可能にする
+        echo "$GITHUB_CONTEXT" > /tmp/github_context.json
+        export GITHUB_CONTEXT="$(cat /tmp/github_context.json)"
+        
+        # Node.js プロジェクトを初期化
+        npm init -y
+        
+        # Notion API クライアントライブラリをインストール
+        npm install @notionhq/client
+        
+        # 作成したJavaScriptファイルを実行
+        node sync-script.js
